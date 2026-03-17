@@ -44,26 +44,47 @@ function AdminDashboard() {
     const confirmed = window.confirm('Delete this event and all its attendees and sponsors?');
     if (!confirmed) return;
 
+    const CHUNK_SIZE = 10;
+
+    const batchDelete = async (docs) => {
+      for (let i = 0; i < docs.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        docs.slice(i, i + CHUNK_SIZE).forEach(d => batch.delete(d));
+        await batch.commit();
+      }
+    };
+
     // Delete attendees
     try {
-    const q = query(collection(db, 'attendees'), where('eventId', '==', eventId));
-    const snapshot = await getDocs(q);
-    const batch = writeBatch(db);
-    snapshot.docs.forEach(d => batch.delete(d.ref));
-    await batch.commit();
+      // Fetch attendees and sponsors first — we need their IDs
+      const [attendeeSnap, sponsorSnap, matchSnap, narrativeCacheSnap] = await Promise.all([
+        getDocs(query(collection(db, 'attendees'), where('eventId', '==', eventId))),
+        getDocs(query(collection(db, 'sponsors'), where('eventId', '==', eventId))),
+        getDocs(query(collection(db, 'matches'), where('eventId', '==', eventId))),
+        getDocs(query(collection(db, 'narrativeCache'), where('eventId', '==', eventId)))
+      ]);
 
-    // Delete sponsors
-    const q2 = query(collection(db, 'sponsors'), where('eventId', '==', eventId));
-    const snapshot2 = await getDocs(q2);
-    const batch2 = writeBatch(db);
-    snapshot2.docs.forEach(d => batch2.delete(d.ref));
-    await batch2.commit();
-    
-    // Delete event
-    await deleteDoc(doc(db, 'events', eventId));
+      const attendeeIds = attendeeSnap.docs.map(d => d.id);
 
-    // Refresh events list
-    fetchEvents();
+      // Build attendeeAnalysis doc refs
+      const attendeeAnalysisRefs = attendeeIds.map(id =>
+        doc(db, 'attendeeAnalysis', id)
+      );
+
+      // Delete everything in parallel where possible
+      await Promise.all([
+        batchDelete(attendeeSnap.docs.map(d => d.ref)),
+        batchDelete(sponsorSnap.docs.map(d => d.ref)),
+        batchDelete(matchSnap.docs.map(d => d.ref)),
+        batchDelete(attendeeAnalysisRefs),
+        batchDelete(narrativeCacheSnap.docs.map(d => d.ref))
+      ]);
+
+      // Delete the event itself last
+      await deleteDoc(doc(db, 'events', eventId));
+
+      // Refresh events list
+      fetchEvents();
     } catch (error) {
       console.error('Error deleting event:', error);
       alert('Failed to delete event. Please try again.');

@@ -41,12 +41,11 @@ function UploadPage() {
       // Fetch the HTML content from the URL
       const proxyUrl = 'https://api.allorigins.win/get?url=';
       const response = await fetch(proxyUrl + encodeURIComponent(eventUrl));
-      const data = await response.json();
-      const html = data.contents;
-
       if (!response.ok) {
         throw new Error(`Failed to fetch URL: ${response.status}`);
       }
+      const data = await response.json();
+      const html = data.contents;
 
       // const html = await response.text();
       
@@ -286,6 +285,10 @@ function UploadPage() {
       const chunk = items.slice(i, i + batchSize);
       const chunkResults = await Promise.all(chunk.map(fn));
       results.push(...chunkResults);
+
+      if (i + batchSize < items.length) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      }
     }
     return results;
   }
@@ -297,16 +300,6 @@ function UploadPage() {
     // Validation
     if (!eventName || !eventDate) {
       setStatus({ type: 'error', message: 'Event name and date are required' });
-      return;
-    }
-
-    if (attendeesData.length === 0) {
-      setStatus({ type: 'error', message: 'Please upload attendees CSV file' });
-      return;
-    }
-
-    if (sponsorsData.length === 0) {
-      setStatus({ type: 'error', message: 'Please upload sponsors CSV file' });
       return;
     }
 
@@ -332,7 +325,7 @@ function UploadPage() {
 
       // Add attendees — deduplication via deterministic ID
       await processInBatches(
-        attendeesData, 10, attendee =>
+        attendeesData, 5, attendee =>
           upsertAttendee(eventId, {
             name: attendee.full_name || attendee.name || '',
             email: attendee.email || '',
@@ -346,13 +339,13 @@ function UploadPage() {
 
       // Add sponsors — deduplication via deterministic ID
       await processInBatches(
-        sponsorsData, 10, sponsor =>
+        sponsorsData, 5, sponsor =>
           upsertSponsor(eventId, {
             companyName: sponsor.sponsor_name || sponsor.company_name || '',
             domain: sponsor.company_domain || sponsor.domain || '',
             promotionType: parseArrayField(sponsor.what_are_they_promoting_at_this_event || sponsor.promotion || ''),
             projectName: sponsor.project_or_product_name || sponsor.project_name || '',
-            attendingTeam: parseArrayField(sponsor.who_is_attending_from_the_company || sponsor.team || ''),
+            attendingTeam: parseTeamField(sponsor.who_is_attending_from_the_company || sponsor.team || ''),
             eventPageUrl: sponsor.event_page_url || sponsor.page_url || null
           })
       );
@@ -386,6 +379,16 @@ function UploadPage() {
       // If not JSON, split by common delimiters
       return field.split(/[,;|]/).map(s => s.trim()).filter(Boolean);
     }
+  };
+
+  const parseTeamField = (field) => {
+    if (!field) return [];
+    const members = parseArrayField(field);
+    return members.map(member => {
+      const match = member.match(/^(.+?)\s*[\(\-]\s*(.+?)[\)]?\s*$/);
+      if (match) return { name: match[1].trim(), title: match[2].trim() };
+      return { name: member.trim(), title: '' };
+    });
   };
 
   return (
@@ -536,7 +539,6 @@ function UploadPage() {
                 accept=".csv"
                 onChange={handleAttendeesUpload}
                 className="file-input"
-                required
               />
             </div>
           </div>
@@ -565,7 +567,6 @@ function UploadPage() {
                 accept=".csv"
                 onChange={handleSponsorsUpload}
                 className="file-input"
-                required
               />
             </div>
           </div>
@@ -581,7 +582,7 @@ function UploadPage() {
             <button 
               type="submit" 
               className="btn-primary"
-              disabled={loading || attendeesData.length === 0 || sponsorsData.length === 0}
+              disabled={loading}
             >
               {loading ? 'Creating Event...' : 'Create Event'}
             </button>

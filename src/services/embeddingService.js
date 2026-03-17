@@ -1,40 +1,63 @@
+import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
+
 // Builds a predictable sponsor ID
 export function buildSponsorText(sponsorData) {
-  let text = sponsorData.companyName?.toLowerCase().trim()+" Domain:"+sponsorData.domain?.toLowerCase().trim()+" Project:"+sponsorData.projectName?.toLowerCase().trim()+" PromotionType:"+(Array.isArray(sponsorData.promotionType) ? sponsorData.promotionType.join(', ') : sponsorData.promotionType || '')+" Team:";
+  const companyName = (sponsorData.companyName ?? '').toLowerCase().trim();
+  const domain = (sponsorData.domain ?? '').toLowerCase().trim();
+  const projectName = (sponsorData.projectName ?? '').toLowerCase().trim();
+  const promotionTypeText = Array.isArray(sponsorData.promotionType)
+    ? sponsorData.promotionType.join(', ')
+    : (sponsorData.promotionType || '');
+
+  let text = `${companyName} Domain:${domain} Project:${projectName} PromotionType:${promotionTypeText} Team:`;
   for (const attendee of sponsorData.attendingTeam || []) {
-    const role = attendee.split('-')[1];
-    if (role) text += role.toLowerCase().trim() + ",";
-  };
+    if (typeof attendee === 'object') {
+      if (attendee.title) text += attendee.title.toLowerCase().trim() + ",";
+    } else {
+      const role = attendee.split('-')[1];
+      if (role) text += role.toLowerCase().trim() + ",";
+    }
+  }
   console.log("Sponsor Text: ", text);
   return text;
 }
 
 // Builds a predictable attendee ID
-export function buildAttendeeText(attendeeData) {
-  let text = attendeeData.name?.toLowerCase().trim()+", "+attendeeData.jobTitle?.toLowerCase().trim()+" at "+attendeeData.company?.toLowerCase().trim()+" Intent:"+attendeeData.intent?.join(',').toLowerCase().trim();
-  console.log("Attendee Text: ", text);
-  return text;
-}
+export function buildAttendeeText(analysis = {}, attendeeData = {}) {
+  const parts = [];
 
-export async function generateEmbedding(text) {
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${apiKey}`;
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'models/text-embedding-004',
-      content: {
-        parts: [{ text }]
-      }
-    })
-  });
-
-  if (!response.ok) {
-    throw new Error(`Embedding API failed: ${response.status}`);
+  if (analysis.summary) {
+    parts.push(analysis.summary);
   }
 
-  const data = await response.json();
-  return data.embedding.values; // array of ~768 numbers
+  if (analysis.primaryGoal) {
+    parts.push(`Goal: ${analysis.primaryGoal}`);
+  }
+
+  if (analysis.roleLevel) {
+    parts.push(`Level: ${analysis.roleLevel}`);
+  }
+
+  if (analysis.technicalProfile) {
+    parts.push(`Profile: ${analysis.technicalProfile}`);
+  }
+
+  if (Array.isArray(analysis.mustHaves) && analysis.mustHaves.length > 0) {
+    parts.push(`Keywords: ${analysis.mustHaves.join(', ')}`);
+  }
+
+  if (attendeeData.company) {
+    parts.push(`Company: ${attendeeData.company}`);
+  }
+
+  return parts.join(' ');
+}
+
+const embeddings = new GoogleGenerativeAIEmbeddings({
+  model: "gemini-embedding-001",
+  apiKey: import.meta.env.VITE_GEMINI_API_KEY
+});
+
+export async function generateEmbedding(text) {
+  return await embeddings.embedQuery(text);
 }

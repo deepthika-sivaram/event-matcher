@@ -11,9 +11,9 @@
 
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { doc, getDoc, collection, query, where, getDocs, addDoc, updateDoc } from 'firebase/firestore';
+import { doc, getDoc, collection, query, where, getDocs, addDoc, updateDoc, writeBatch } from 'firebase/firestore';
 import { db } from '../services/firebase';
-import { runMatching } from '../services/gemini';
+import { runMatching } from '../services/matchingOrchestrator';
 import './EventDetailPage.css';
 import { sendMatchEmail } from '../services/email';
 import Papa from 'papaparse';
@@ -86,11 +86,25 @@ function EventDetailPage() {
     setMatchResult(null);
 
     try {
+      // Check if match already exists
+      const existingMatch = await getDocs(
+        query(collection(db, 'matches'), 
+          where('eventId', '==', eventId),
+          where('attendeeId', '==', attendee.id)
+        )
+      );
+
+      if (!existingMatch.empty) {
+        setMatchResult(existingMatch.docs[0].data());
+        setShowModal(true);
+        setMatching(false);
+        return; // skip pipeline entirely
+      }
       const result = await runMatching(attendee, sponsors, event);
       setMatchResult(result);
       setShowModal(true);
 
-      await addDoc(collection(db, 'matches'), {
+      await addDoc(collection(db, 'matches'), sanitizeForFirestore({
         eventId,
         attendeeId: attendee.id,
         attendeeName: attendee.name || '',
@@ -103,7 +117,7 @@ function EventDetailPage() {
         emailSubject: result.subject || '',
         emailStatus: 'pending',
         createdAt: new Date()
-      });
+      }));
 
     } catch (error) {
       console.error('Matching error:', error);
@@ -111,6 +125,12 @@ function EventDetailPage() {
     } finally {
       setMatching(false);
     }
+  };
+
+  const sanitizeForFirestore = (obj) => {
+    return JSON.parse(JSON.stringify(obj, (key, value) => 
+      value === undefined ? null : value
+    ));
   };
 
   // NEW: Batch matching for all attendees
@@ -145,11 +165,25 @@ function EventDetailPage() {
           setCurrentAttendee(attendee.name);
           
           try {
+            // Check if match already exists
+            const existingMatch = await getDocs(
+              query(collection(db, 'matches'),
+                where('eventId', '==', eventId),
+                where('attendeeId', '==', attendee.id)
+              )
+            );
+
+            if (!existingMatch.empty) {
+              console.log(`⚡ Cache hit: ${attendee.name}`);
+              return { success: true, attendee, fromCache: true,
+                topMatches: existingMatch.docs[0].data().sponsorMatches?.slice(0, 3).map(m => m.sponsor) || []
+              };
+            }
             console.log(`\n🎯 Matching: ${attendee.name}`);
             
             const result = await runMatching(attendee, sponsors, event);
             
-            await addDoc(collection(db, 'matches'), {
+            await addDoc(collection(db, 'matches'), sanitizeForFirestore({
               eventId,
               attendeeId: attendee.id,
               attendeeName: attendee.name || '',
@@ -162,7 +196,7 @@ function EventDetailPage() {
               emailSubject: result.subject || '',
               emailStatus: 'pending',
               createdAt: new Date()
-            });
+            }));
             
             console.log(`✅ Success: ${attendee.name}`);
             
@@ -232,12 +266,41 @@ function EventDetailPage() {
     setShowBatchModal(false);
   };
 
+  // Helper function to parse array fields from CSV
+  const parseArrayField = (field) => {
+    if (!field) return [];
+    if (Array.isArray(field)) return field;
+    
+    // Try to parse as JSON array
+    try {
+      const parsed = JSON.parse(field);
+      return Array.isArray(parsed) ? parsed : [field];
+    } catch {
+      // If not JSON, split by common delimiters
+      return field.split(/[,;|]/).map(s => s.trim()).filter(Boolean);
+    }
+  };
+
+  const parseTeamField = (field) => {
+    if (!field) return [];
+    const members = parseArrayField(field);
+    return members.map(member => {
+      const match = member.match(/^(.+?)\s*[\(\-]\s*(.+?)[\)]?\s*$/);
+      if (match) return { name: match[1].trim(), title: match[2].trim() };
+      return { name: member.trim(), title: '' };
+    });
+  };
+
   async function processInBatches(items, batchSize, fn) {
     const results = [];
     for (let i = 0; i < items.length; i += batchSize) {
       const chunk = items.slice(i, i + batchSize);
       const chunkResults = await Promise.all(chunk.map(fn));
       results.push(...chunkResults);
+
+      if (i + batchSize < items.length) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      }
     }
     return results;
   }
@@ -249,7 +312,7 @@ function EventDetailPage() {
   try {
     // Process attendees — each upsert returns true (new) or false (duplicate)
     const attendeeResults = await processInBatches(
-        uploadAttendeesData, 10, attendee =>
+        uploadAttendeesData, 5, attendee =>
         upsertAttendee(eventId, {
           name: attendee.full_name || attendee.name || '',
           email: attendee.email || '',
@@ -261,12 +324,14 @@ function EventDetailPage() {
 
     // Process sponsors — same pattern
     const sponsorResults = await processInBatches(
-        uploadSponsorsData, 10, sponsor =>
+        uploadSponsorsData, 5, sponsor =>
         upsertSponsor(eventId, {
           companyName: sponsor.sponsor_name || sponsor.company_name || '',
           domain: sponsor.company_domain || sponsor.domain || '',
-          promotionType: sponsor.what_are_they_promoting_at_this_event || '',
-          projectName: sponsor.project_or_product_name || ''
+          promotionType: parseArrayField(sponsor.what_are_they_promoting_at_this_event || sponsor.promotion || ''),
+          projectName: sponsor.project_or_product_name || sponsor.project_name || '',
+          attendingTeam: parseTeamField(sponsor.who_is_attending_from_the_company || sponsor.team || ''),
+          eventPageUrl: sponsor.event_page_url || sponsor.page_url || null
         })
     );
 
@@ -275,11 +340,25 @@ function EventDetailPage() {
     const dupAttendees = attendeeResults.length - newAttendees;
     const newSponsors = sponsorResults.filter(Boolean).length;
     const dupSponsors = sponsorResults.length - newSponsors;
-
+    
     await updateDoc(doc(db, 'events', eventId), {
       attendeeCount: attendees.length + newAttendees,
       sponsorCount: sponsors.length + newSponsors
     });
+
+    if (newSponsors > 0) {
+      // Sponsors changed — invalidate all cached matches for this event
+      const matchesQuery = query(collection(db, 'matches'), where('eventId', '==', eventId));
+      const matchesSnapshot = await getDocs(matchesQuery);
+      const matchesDocs = matchesSnapshot.docs;
+      const BATCH_LIMIT = 500;
+      for (let i = 0; i < matchesDocs.length; i += BATCH_LIMIT) {
+        const batch = writeBatch(db);
+        const chunk = matchesDocs.slice(i, i + BATCH_LIMIT);
+        chunk.forEach((d) => batch.delete(d.ref));
+        await batch.commit();
+      }
+    }
 
     // Build a readable summary message
     const parts = [];
